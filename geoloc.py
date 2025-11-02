@@ -1,101 +1,116 @@
 import json, math, requests, streamlit as st, streamlit.components.v1 as components
 
-st.set_page_config(page_title="Localisation automatique", page_icon="📍")
-st.title("📍 Ma localisation")
+st.set_page_config(page_title="Localisation robuste", page_icon="📍")
+st.title("📍 Localisation + Adresse (avec diagnostic)")
 
-# --- HTML + JS : récupère la position automatiquement
+# === 1) FRONT : récup auto + bouton retry
 val = components.html("""
-<div id="zone" style="padding:8px 0;">
-  <b>Récupération de la localisation...</b>
+<div style="display:flex;gap:8px;align-items:center">
+  <button id="retry" style="padding:8px 12px;border-radius:6px;cursor:pointer">🔄 Réessayer</button>
+  <span id="info">Recherche de localisation…</span>
 </div>
 <script>
 function send(v){
-  window.parent.postMessage(
-    { isStreamlitMessage: true, type: "streamlit:setComponentValue", value: v },
-    "*"
-  );
+  window.parent.postMessage({isStreamlitMessage:true,type:"streamlit:setComponentValue",value:v},"*");
 }
-
 function locate(){
-  if(!navigator.geolocation){
-    document.getElementById("zone").innerText = "Géolocalisation non supportée.";
-    send(null);
-    return;
-  }
+  const el = document.getElementById("info");
+  if(!navigator.geolocation){ el.textContent="Géolocalisation non supportée."; send(JSON.stringify({error:"no_geolocation"})); return; }
   navigator.geolocation.getCurrentPosition(
     pos=>{
       const out={lat:pos.coords.latitude,lon:pos.coords.longitude,accuracy:pos.coords.accuracy};
-      document.getElementById("zone").innerHTML = 
-        `✅ Localisation trouvée (±${Math.round(out.accuracy)} m)`;
+      el.textContent=`✅ OK (±${Math.round(out.accuracy)} m)`;
       send(JSON.stringify(out));
     },
     err=>{
-      document.getElementById("zone").innerText = 
-        "Localisation refusée ou impossible. Valeurs par défaut affichées.";
-      // Valeur par défaut : Paris
-      send(JSON.stringify({lat:48.8566, lon:2.3522, accuracy:999}));
+      el.textContent = (err.code===1)?"Permission refusée.":
+                       (err.code===2)?"Position indisponible.":"Erreur de géolocalisation.";
+      // fallback visible (Paris)
+      send(JSON.stringify({lat:48.8566,lon:2.3522,accuracy:999, note:"fallback"}));
     },
-    {enableHighAccuracy:true,timeout:10000,maximumAge:0}
+    {enableHighAccuracy:true,timeout:15000,maximumAge:0}
   );
 }
+document.getElementById("retry").onclick = locate;
 locate();
 </script>
 """, height=50)
 
-# --- fonction pour requêter IGN (adresse)
-def ign_reverse_address(lat, lon, meters=60, layer="BAN:adresse"):
+# === 2) BACK : reverse IGN avec 2 couches + diagnostics
+def ign_reverse(lat, lon, meters=80, layers=("BAN.DATA.GOUV:ban","BAN:adresse")):
     dlat = meters / 111_320.0
     dlon = meters / (111_320.0 * math.cos(math.radians(lat)))
-    ring = []
-    for i in range(24):
-        ang = 2 * math.pi * i / 24
-        ring.append([lon + dlon * math.cos(ang), lat + dlat * math.sin(ang)])
+    ring=[]
+    for i in range(32):
+        ang = 2*math.pi*i/32
+        ring.append([lon + dlon*math.cos(ang), lat + dlat*math.sin(ang)])
     ring.append(ring[0])
-    geom = {"type": "Polygon", "coordinates": [ring]}
-    try:
-        r = requests.get(
-            "https://apicarto.ign.fr/api/wfs/geoportail",
-            params={"source": layer, "geom": json.dumps(geom), "_limit": "50"},
-            headers={"User-Agent": "Streamlit-Geo/1.0"},
-            timeout=10,
-        )
-        if not r.ok:
-            return None
-        data = r.json()
-        feats = data.get("features", [])
-        if not feats:
-            return None
-        best = min(
-            feats,
-            key=lambda f: (f["geometry"]["coordinates"][0] - lon)**2
-                          + (f["geometry"]["coordinates"][1] - lat)**2
-        )
-        props = best.get("properties", {})
-        x, y = best["geometry"]["coordinates"]
-        label = props.get("nom_complet") or props.get("label") or "Adresse inconnue"
-        return {"adresse": label.strip(), "lat": y, "lon": x}
-    except Exception:
-        return None
+    geom = {"type":"Polygon","coordinates":[ring]}
 
-# --- Traitement et affichage
-if val:
+    last = {}
+    for layer in layers:
+        try:
+            r = requests.get(
+                "https://apicarto.ign.fr/api/wfs/geoportail",
+                params={"source": layer, "geom": json.dumps(geom), "_limit":"60"},
+                headers={"User-Agent":"Streamlit-Geo/1.0"},
+                timeout=12,
+            )
+            last = {"layer": layer, "http": r.status_code}
+            if not r.ok:
+                last["body"] = r.text[:400]
+                continue
+            data = r.json()
+            last["json_keys"] = list(data.keys())
+            feats = data.get("features", [])
+            last["features"] = len(feats)
+            if not feats:
+                continue
+            best = min(feats, key=lambda f:(f["geometry"]["coordinates"][0]-lon)**2 + (f["geometry"]["coordinates"][1]-lat)**2)
+            x, y = best["geometry"]["coordinates"]
+            p = best.get("properties", {})
+            label = p.get("nom_complet") or p.get("label") or p.get("numero_nom_voie") or "Adresse inconnue"
+            return {"adresse": label.strip(), "lat": y, "lon": x, "layer": layer}, last
+        except Exception as e:
+            last = {"layer": layer, "error": str(e)}
+            continue
+    return None, last
+
+# === 3) Traitement + affichage (avec garde-fous)
+if val is None:
+    st.warning("Aucune valeur reçue du composant. Vérifie HTTPS / autorisations.")
+else:
     try:
-        data = json.loads(val)
-        lat, lon = data["lat"], data["lon"]
-        st.subheader("📌 Coordonnées détectées")
+        # 'val' peut être str JSON ou déjà dict; on gère les 2
+        data = json.loads(val) if isinstance(val, str) else val
+    except Exception as e:
+        st.error("Impossible de décoder la valeur reçue du navigateur.")
+        st.code(str(val))
+        st.caption(f"Parse error: {e}")
+        st.stop()
+
+    # Affichage coords brutes
+    if isinstance(data, dict) and ("lat" in data and "lon" in data):
+        lat, lon = float(data["lat"]), float(data["lon"])
+        st.subheader("📌 Coordonnées")
         st.write(f"Latitude : **{lat:.6f}**")
         st.write(f"Longitude : **{lon:.6f}**")
-        st.write(f"Précision : ±{int(data['accuracy'])} m")
+        if "accuracy" in data: st.write(f"Précision (navigateur) : ±{int(round(data['accuracy']))} m")
+        if data.get("note") == "fallback":
+            st.info("Localisation refusée/indispo : valeurs par défaut utilisées (Paris).")
 
-        res = ign_reverse_address(lat, lon)
-        st.subheader("🏠 Adresse")
+        # Reverse
+        res, diag = ign_reverse(lat, lon)
+        st.subheader("🏠 Adresse (IGN)")
         if res:
-            st.success(res['adresse'])
+            st.success(f"{res['adresse']}")
+            st.caption(f"Source: {res['layer']}")
         else:
-            st.warning("Aucune adresse trouvée. (Zone sans point adresse)")
-    except Exception:
-        st.error("Erreur lors de la récupération des données.")
-else:
-    st.info("En attente d'autorisation de localisation…")
+            st.error("Aucune adresse trouvée ou erreur API.")
+            st.write("Diagnostic :")
+            st.json(diag)
+    else:
+        st.error("Format de données inattendu depuis le navigateur :")
+        st.code(str(data))
 
-st.caption("⚠️ Nécessite HTTPS et l'autorisation du navigateur pour la géolocalisation.")
+st.caption("Rappels : HTTPS (ou localhost) obligatoire, autoriser la localisation dans le navigateur.")
